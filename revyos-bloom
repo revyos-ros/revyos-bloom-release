@@ -1,0 +1,92 @@
+#!/bin/bash
+# usage: revyos-bloom [pkg_name]
+
+
+set -x
+
+# https://stackoverflow.com/questions/59895
+export SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
+
+PKG_NAME=$1
+if [ $PKG_NAME -eq 0 ]
+then
+    echo 'input at leaset one parameter: pkg name'
+fi
+
+TIME_STAMP=$(date +"%m%d-%H%M%S")
+
+
+# Get package group name(real package name) and upstream url
+curl https://raw.githubusercontent.com/revyos-ros/rosdistro/master/humble/distribution.yaml > /tmp/$TIME_STAMP-distribution.yaml
+pkg_result=( $($SCRIPT_DIR/revyos-bloom-get-pkg-info.py /tmp/$TIME_STAMP-distribution.yaml $PKG_NAME) )
+PKG_NAME=${pkg_result[0]}
+UPSTREAM_OWNER=${pkg_result[1]}
+UPSTREAM_REPO=${pkg_result[2]}
+
+if [ "$PKG_NAME" = "ERR" ]
+then
+    echo 'pkg not found in rosdistro repo'
+    exit 1
+fi
+
+# Installing Github CLI on Linux and BSD
+# https://github.com/cli/cli/blob/trunk/docs/install_linux.md
+gh
+if [ $? -ne 0 ]
+then
+    # GitHub CLI manual
+    # https://cli.github.com/manual/
+    # Do not forget to auth after installed
+    (type -p wget >/dev/null || (sudo apt update && sudo apt-get install wget -y)) \
+    && sudo mkdir -p -m 755 /etc/apt/keyrings \
+    && wget -qO- https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null \
+    && sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
+    && sudo apt update \
+    && sudo apt install gh -y \
+    && gh auth login
+fi
+
+# Fork the repo
+REVYOS_OWNER='revyos-ros'
+if [ -z $(gh repo list ${REVYOS_OWNER} -L 2000 | grep $UPSTREAM_REPO) ]
+then
+   yes 'n' | gh repo fork $UPSTREAM_OWNER/$UPSTREAM_REPO --org $REVYOS_OWNER
+else
+   echo 'already forked to revyos'
+   echo 'please check if you have released the pkg'
+   #exit
+fi
+
+LC_REPO=/tmp/$TIME_STAMP-$UPSTREAM_REPO
+RELEASE_REPO_URL=git@github.com:$REVYOS_OWNER/$UPSTREAM_REPO.git
+git clone --depth=1 $RELEASE_REPO_URL $LC_REPO \
+    && cd $LC_REPO  \
+    && $SCRIPT_DIR/revyos-bloom-release-repo.py git@github.com:$REVYOS_OWNER/$UPSTREAM_REPO.git  \
+    && git commit -am 'remove unnecessary branches for revyos' \
+    && git push 
+
+OLD_VERSION=''
+NEW_VERSION=''
+if [ $? -eq 0 ]
+then
+    # TODO: still need select by hand
+    bloom-release --override-release-repository-url=$RELEASE_REPO_URL -r humble $PKG_NAME |& tee /tmp/$TIME_STAMP-bloom-release-log
+    # OLD_VERSION=$(cat /tmp/$TIME_STAMP-bloom-release-log | grep "-      version:")
+    # OLD_VERSION=${OLD_VERSION##* }
+    NEW_VERSION=$(cat /tmp/$TIME_STAMP-bloom-release-log | grep "+      version:")
+    NEW_VERSION=${NEW_VERSION##* }
+else
+    echo 'release repo operation failed'
+fi
+
+LC_ROSDISTRO=/tmp/$TIME_STAMP-rosdistro
+git clone --depth=1 git@github.com:revyos-ros/rosdistro.git $LC_ROSDISTRO \
+    && cd $LC_ROSDISTRO \
+    && $SCRIPT_DIR/revyos-bloom-rosdistro.py $PKG_NAME https://github.com/$REVYOS_OWNER/$UPSTREAM_REPO.git $NEW_VERSION \
+    && git commit -am "release $PKG_NAME to revyos : $NEW_VERSION" \
+    && git push
+
+#rm -rf ${LC_REPO}
+#rm -rf ${LC_VENV}
+
